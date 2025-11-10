@@ -164,6 +164,7 @@ def get_pkg_info(path):
             # dpkg -l 출력의 5번째 줄(헤더 제외)에서 버전 정보 파싱
             lines = ver_output.split('\n')
             if len(lines) > 5:
+                # 정규식 수정: 패키지 이름이 정확히 일치하는 라인 찾기
                 ver_match = re.search(r'^\S+\s+' + re.escape(pkg_name) + r'\s+(\S+)\s+(\S+)\s+', lines[5])
                 if ver_match:
                     version = ver_match.group(1) # [1]이 버전, [2]가 아키텍처
@@ -187,13 +188,19 @@ def get_pip_libs(pid):
                 # -> numpy 시도
                 parts = lib.path.split('/')
                 try:
-                    dist_index = parts.index('dist-packages')
-                    if dist_index + 1 < len(parts):
-                        lib_name = parts[dist_index + 1].split('.')[0] # 'numpy'
+                    # 'dist-packages' 또는 'site-packages' 찾기
+                    pkg_dir_index = -1
+                    if 'dist-packages' in parts:
+                        pkg_dir_index = parts.index('dist-packages')
+                    elif 'site-packages' in parts:
+                         pkg_dir_index = parts.index('site-packages')
+                    
+                    if pkg_dir_index != -1 and pkg_dir_index + 1 < len(parts):
+                        lib_name = parts[pkg_dir_index + 1].split('.')[0] # 'numpy'
                     else:
                         continue
                 except ValueError:
-                    # dist-packages가 없는 경우, .so 파일 이름에서 추측 (정확도 낮음)
+                    # 패키지 디렉토리가 없는 경우, .so 파일 이름에서 추측 (정확도 낮음)
                     lib_name = lib.path.split('/')[-1].split('.')[0]
 
                 if lib_name and lib_name not in [l['Name'] for l in libs]:
@@ -216,8 +223,12 @@ def get_java_libs(pid):
         pass
     return libs
 
+# --- 🔽 [***수정된 함수***] 🔽 ---
 def get_process_info(pid: int) -> dict:
-    """단일 PID에 대해 상세 정보를 수집합니다. (Script 2의 핵심 로직)"""
+    """
+    단일 PID에 대해 상세 정보를 수집합니다.
+    (memory_peak 및 network_calls 수집 로직 강화)
+    """
     try:
         p = psutil.Process(pid)
         name = p.name()
@@ -225,12 +236,39 @@ def get_process_info(pid: int) -> dict:
         threads = p.num_threads()
         status = p.status()
 
-        # 메모리 및 네트워크 사용량 수집
-        memory_percent = p.memory_percent()
+        # --- 🔽 [수정된 부분 1: 4가지 특성 수집] 🔽 ---
+        
+        # 1. PID (매개변수로 받음)
+        # 2. Description (name, path로 수집됨)
+        
+        # 3. Memory (현재 사용률 + 최대 사용량)
+        memory_percent = p.memory_percent() # 현재 메모리 사용률 (%)
+        
+        # (신규) 최대 메모리 사용량 (memory_peak) (Linux 전용)
+        memory_peak_kb = 0 # KB 단위
         try:
-            net_connections = len(p.connections())
+            # Linux 환경에서 /proc 파일시스템을 읽어 VmPeak 수집
+            if platform.system() == "Linux":
+                with open(f"/proc/{pid}/status") as f:
+                    for line in f:
+                        if line.startswith("VmPeak:"):
+                            memory_peak_kb = int(line.split()[1])
+                            break
+        except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess, PermissionError):
+            pass # 프로세스가 그 사이에 종료됐거나 권한 없음
+        
+        # 4. Network (누적 IO 카운터) (network_calls 대용)
+        try:
+            # p.connections() 대신 누적 IO 카운터 사용
+            net_io = p.net_io_counters()
+            # 딕셔너리로 변환하여 저장 (예: bytes_sent, bytes_recv 등)
+            net_io_dict = net_io._asdict()
         except (psutil.AccessDenied, psutil.NoSuchProcess):
-            net_connections = 0 # 권한 문제 또는 프로세스 종료 시
+            net_io_dict = {} # 권한 없는 경우
+        except Exception: 
+            # 일부 OS/환경(예: WSL 초기버전)에서 지원 안할 수 있음
+            net_io_dict = {}
+        # --- 🔼 [수정 완료 1] 🔼 ---
 
         base_info = {
             'PID': pid,
@@ -238,8 +276,9 @@ def get_process_info(pid: int) -> dict:
             'Path': path,
             'Threads': threads,
             'Status': status,
-            'MemoryPercent': memory_percent,
-            'NetConnections': net_connections
+            'MemoryPercent': memory_percent,  # (기존) 현재 사용률
+            'MemoryPeakKB': memory_peak_kb,  # (신규) 최대 사용량 (KB)
+            'NetIOCounters': net_io_dict     # (신규) 네트워크 IO
         }
 
         # 인터프리터(Python, Java 등) 감지
@@ -260,12 +299,15 @@ def get_process_info(pid: int) -> dict:
                 base_info['Package'] = pkg_name
                 base_info['Version'] = version
                 base_info['PURL'] = purl
+            
+            # pkg 정보가 있든 없든 base_info 반환
             return base_info
 
     except (psutil.NoSuchProcess, psutil.AccessDenied, FileNotFoundError):
         # 프로세스가 이미 종료되었거나 권한이 없는 경우
         pass
     return None
+# --- 🔼 [***수정 완료***] 🔼 ---
 
 
 # --- SBOM 및 Syft 헬퍼 (Script 1) ---
@@ -282,7 +324,7 @@ def new_sbom():
                 {
                     "vendor": "custom",
                     "name": "runtime-sbom-monitor",
-                    "version": "1.1-merged"
+                    "version": "1.2-merged-v2" # 버전 업데이트
                 }
             ],
             "component": {
@@ -405,8 +447,10 @@ def main_loop():
             return
             
         # (참고) 자기 자신(모니터) 또는 syft가 실행되는 것은 무시
-        if proc_name_raw.startswith('python') and 'runtime_sbom' in exe_file:
-            return
+        if proc_name_raw.startswith('python') and ('runtime_sbom' in exe_file or 'python3' in exe_file):
+             # 스크립트 자체가 실행되는 것을 무시 (경로에 따라 조정 필요)
+            if 'runtime_sbom_monitor' in exe_file:
+                return
         if proc_name_raw == 'syft':
             return
 
@@ -445,9 +489,12 @@ def main_loop():
         # 5. 메인 컴포넌트 추가 (실행된 바이너리)
         main_component = {
             "type": "application",
-            "name": proc_name_raw,
+            "name": proc_name_raw, # 'description'에 해당
             "version": "runtime",
-            "properties": [{"name": "file_path", "value": exe_file}]
+            "properties": [
+                {"name": "file_path", "value": exe_file}, # 'description'에 해당
+                {"name": "pid", "value": str(pid)} # 'pid'에 해당
+            ]
         }
 
         if process_info:
@@ -458,19 +505,29 @@ def main_loop():
             else:
                 main_component['purl'] = f"pkg:generic/{proc_name_raw}?pid={pid}&exe={exe_file}"
 
+            # --- 🔽 [***수정된 부분: 4가지 특성 반영***] 🔽 ---
             # Script 2의 리소스 정보 추가
             main_component["properties"].extend([
                 {"name": "status", "value": process_info.get('Status', 'unknown')},
                 {"name": "threads", "value": str(process_info.get('Threads', '0'))},
+                # 'memory_peak' (현재)
                 {"name": "memoryPercent", "value": f"{process_info.get('MemoryPercent', 0):.2f}%"},
-                {"name": "netConnections", "value": str(process_info.get('NetConnections', '0'))}
+                # 'memory_peak' (최대)
+                {"name": "memoryPeakKB", "value": str(process_info.get('MemoryPeakKB', '0'))}
             ])
+            
+            # 'network_calls' (누적 IO)
+            net_io_data = process_info.get('NetIOCounters', {})
+            for key, value in net_io_data.items():
+                main_component["properties"].append({"name": f"netIO_{key}", "value": str(value)})
+            # --- 🔼 [***수정 완료***] 🔼 ---
+
             if process_info.get('Package'):
-                 main_component["properties"].append({"name": "dpkg.package", "value": process_info.get('Package')})
+                 main_component["properties"].append({"name": "dpkg.package", "value": process_info.get('Package')}) # 'description'에 해당
 
         else:
             # 프로세스가 너무 빨리 종료되어 get_process_info가 실패한 경우
-            main_component['purl'] = f"pkg:generic/{proc_name_raw}?pid={pid}&exe={exe_file}&status=terminated"
+            main_component['purl'] = f"pkg:generic/{proc_name_raw}?pid={pid}&status=terminated"
 
         runtime_sbom["components"].append(main_component)
         seen_purls.add(main_component['purl'])
@@ -481,10 +538,13 @@ def main_loop():
                 lib_name = lib.get('Name', 'unknown-lib')
                 lib_path = lib.get('Path', 'unknown-path')
                 
-                if name.lower().startswith('python'):
+                # 'name'은 process_info의 'Name' (예: python3)
+                proc_name_lower = process_info.get('Name', '').lower()
+
+                if proc_name_lower.startswith('python'):
                     lib_type = "library"
                     purl = f"pkg:pypi/{lib_name}" # PURL 추측
-                elif name.lower() == 'java':
+                elif proc_name_lower == 'java':
                     lib_type = "library"
                     # JAR 파일 이름에서 버전 추측 시도 (예: log4j-core-2.17.1.jar)
                     ver_match = re.search(r'-([\d\.]+.*?)(\.jar)', lib_name)
