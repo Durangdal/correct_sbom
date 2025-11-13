@@ -62,6 +62,15 @@ def log(msg):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
+def save_sbom(sbom, filename):
+    """SBOM 딕셔너리를 지정된 파일에 저장"""
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(sbom, f, indent=2, ensure_ascii=False)
+        log(f"SBOM 저장됨 → {filename} (components={len(sbom['components'])})")
+    except Exception as e:
+        log(f"SBOM 저장 실패: {e}")
+
 # 파일 해시 계산 (SHA-256) (원래 함수 유지)
 def calculate_file_hash(file_path, algorithm='sha256'):
     """파일의 해시값을 계산"""
@@ -400,7 +409,7 @@ def main():
             root_folder_id = find_or_create_folder(google_drive_service, DRIVE_ROOT_FOLDER_NAME)
             log(f"Google Drive: 로그 저장 폴더 ID 획득: {root_folder_id}")
         else:
-            log("Google Drive 서비스 초기화 실패. 업로드를 건너뜀.")
+            log("Google Drive 서비스 초기화 실패. 업로드를 건너뜜.")
             root_folder_id = None
     else:
         root_folder_id = None # 라이브러리 미설치 시 업로드 건너뛰기
@@ -441,7 +450,7 @@ def main():
                 libs_info = get_loaded_libs(pid)
                 runtime_sbom_os = create_cyclonedx_sbom(exe_name_raw, pid, libs_info, runtime=True)
                 runtime_output_file = os.path.join(output_dir, f"runtime_sbom_os_libs_{pid}.json")
-                save_sbom(runtime_sbom_os, runtime_output_file)
+                save_sbom(runtime_sbom_os, runtime_output_file) # <-- save_sbom 호출
 
                 # 5. 애플리케이션 내부 의존성 SBOM 생성 (Syft 프로세스 스캔)
                 get_app_internal_libs(exe_name, pid, output_dir, proc_cmdline_list)
