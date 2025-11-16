@@ -1,3 +1,16 @@
+#<윈도우 SBOM생성 파일정리>
+#sbom_logs 폴더 생성
+#그 아래 5가지의 파일 생성
+# 1. runtime_context_1234.json	| 단순 JSON	
+# - 실행 명령어, 환경 변수 저장파일
+# 2. process_info_ext_1234.json	| 단순 JSON	
+# - 메모리 피크, 네트워크 IO, Python/Java 라이브러리 저장 파일
+# 3. runtime_sbom_os_libs_1234.json	| CycloneDX	
+# - OS 라이브러리 (.dll) + 해시/버전 저장 파일
+# 4. internal_sbom_app_libs_...json 	| CycloneDX	
+# - 앱 라이브러리 (예: requests, numpy)
+# 5. static_sbom_python.exe_1234.json	| CycloneDX	
+# - 실행 파일 자체 (예: python.exe)의 정적 분석
 
 #!/usr/bin/env python3
 import os
