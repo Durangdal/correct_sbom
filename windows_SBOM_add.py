@@ -1,16 +1,17 @@
-#<윈도우 SBOM생성 파일정리>
 #sbom_logs 폴더 생성
-#그 아래 5가지의 파일 생성
-# 1. runtime_context_1234.json	| 단순 JSON	
-# - 실행 명령어, 환경 변수 저장파일
-# 2. process_info_ext_1234.json	| 단순 JSON	
-# - 메모리 피크, 네트워크 IO, Python/Java 라이브러리 저장 파일
-# 3. runtime_sbom_os_libs_1234.json	| CycloneDX	
-# - OS 라이브러리 (.dll) + 해시/버전 저장 파일
-# 4. internal_sbom_app_libs_...json 	| CycloneDX	
-# - 앱 라이브러리 (예: requests, numpy)
-# 5. static_sbom_python.exe_1234.json	| CycloneDX	
-# - 실행 파일 자체 (예: python.exe)의 정적 분석
+#그 아래 6가지의 파일 생성
+#1. runtime_context_1234.json        	| 단순 JSON	
+#- 실행 명령어, 환경 변수 저장파일
+#2. process_info_ext_1234.json    	    | 단순 JSON	
+#- 메모리 피크, 네트워크 IO, Python/Java 라이브러리 저장 파일
+#3. runtime_sbom_os_libs_1234.json	    | CycloneDX	
+#- OS 라이브러리 (.dll) + 해시/버전 저장 파일
+#4. internal_sbom_app_libs_...json 	    | CycloneDX	
+#- 앱 라이브러리 (예: requests, numpy)
+#5. static_sbom_python.exe_1234.json	| CycloneDX	
+#- 실행 파일 자체 (예: python.exe)의 정적 분석
+#6. sbom_output.json
+#- Colab연동, AI 학습을 위한 통합 목록, 스크립트 실행 종료시 생성(불완전한 데이터 및 비효율적인 측면을 고려해 종료시 파일 생성)
 
 #!/usr/bin/env python3
 import os
@@ -55,6 +56,12 @@ folder_counter = count(1)
 # (Script 2) 스레드 안전용 락
 counter_lock = threading.Lock()
 
+# --- [Colab 연동용 전역 변수 추가] ---
+colab_data_lock = threading.Lock()
+all_components_for_colab = []
+seen_purls_for_colab = set()
+# --- [Colab 추가 완료] ---
+
 
 # --- 유틸리티 함수 (Script 1) ---
 def log(msg):
@@ -70,12 +77,45 @@ def save_sbom(sbom, filename):
     try:
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(sbom, f, indent=2, ensure_ascii=False)
-        log(f"  > [S1] SBOM 저장됨 → {os.path.basename(filename)}")
+        log(f"  > [S1] 상세 SBOM 저장됨 → {os.path.basename(filename)}")
     except Exception as e:
-        log(f"  > [S1] SBOM 저장 실패: {e}")
+        log(f"  > [S1] 상세 SBOM 저장 실패: {e}")
+
+# --- [Colab 연동용 함수 추가] ---
+def save_colab_json(filename):
+    """Colab 분석용 플랫 JSON 파일을 저장합니다."""
+    global all_components_for_colab
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(all_components_for_colab, f, indent=2, ensure_ascii=False)
+        log(f"✅ [Colab] AI 분석용 SBOM 저장 완료 → {filename}")
+        log(f"   (총 {len(all_components_for_colab)}개 컴포넌트 저장됨)")
+    except Exception as e:
+        log(f"❌ [Colab] AI 분석용 SBOM 저장 실패: {e}")
+
+def parse_syft_json_for_colab(syft_json_string):
+    """(Helper) Syft JSON 출력을 파싱하여 Colab용 딕셔너리 리스트로 반환"""
+    components_list = []
+    if not syft_json_string:
+        return components_list
+    try:
+        sbom_data = json.loads(syft_json_string)
+        components = sbom_data.get("components", [])
+        for comp in components:
+            components_list.append({
+                "Name": comp.get("name"),
+                "Version": comp.get("version"),
+                "PURL": comp.get("purl"),
+                "Path": f"syft:{comp.get('type')}" # 'Path'를 'description'으로 사용
+            })
+    except json.JSONDecodeError:
+        log("  > [Colab] Syft JSON 파싱 실패")
+    return components_list
+# --- [Colab 추가 완료] ---
+
 
 def calculate_file_hash(file_path, algorithm='sha256'):
-    """파일의 해시값을 계산 (Script 1)"""
+    """(Script 1) 파일의 해시값을 계산"""
     try:
         hasher = hashlib.new(algorithm)
         with open(file_path, 'rb') as file:
@@ -86,7 +126,7 @@ def calculate_file_hash(file_path, algorithm='sha256'):
         return ""
 
 def get_file_version_info(file_path):
-    """Windows PE 파일에서 버전 문자열을 추출 (Script 1)"""
+    """(Script 1) Windows PE 파일에서 버전 문자열을 추출"""
     if pefile is None or not os.name == 'nt':
         return None
     try:
@@ -115,7 +155,6 @@ def get_loaded_libs_v1(pid):
         proc = psutil.Process(pid)
         for m in proc.memory_maps():
             path = getattr(m, "path", None)
-            # [수정] Windows/Linux 경로 호환성
             if not path or not os.path.isfile(path) or path.startswith('['):
                 continue
             
@@ -133,13 +172,13 @@ def get_loaded_libs_v1(pid):
         log(f"  > [S1] get_loaded_libs_v1 오류: {e}")
     return libs_info
 
-# --- [Script 2 기능 추가] ---
+# --- [Script 2 기능] ---
 def get_pkg_info(path):
     """(Script 2) Debian/Ubuntu 환경에서 dpkg 패키지 정보를 조회합니다."""
-    # [수정] Windows에서는 이 기능이 작동하지 않도록 보호
     if platform.system() != "Linux" or not which("dpkg"):
         return None, None, None
     try:
+        # ... (Script 2의 로직) ...
         output = subprocess.check_output(['dpkg', '-S', path], stderr=subprocess.STDOUT, text=True)
         match = re.search(r'([\w\d\.\-]+):', output)
         if match:
@@ -214,7 +253,6 @@ def get_process_info(pid: int) -> dict:
                         if line.startswith("VmPeak:"):
                             memory_peak_kb = int(line.split()[1]); break
             elif os.name == 'nt':
-                 # [수정] Script 1의 Windows 기반을 유지하기 위해 Windows 호환 코드 사용
                  memory_peak_bytes = p.memory_info().peak_wset
                  memory_peak_kb = memory_peak_bytes / 1024
         except Exception: pass
@@ -231,7 +269,6 @@ def get_process_info(pid: int) -> dict:
             'NetIOCounters': net_io_dict
         }
 
-        # 인터프리터 감지 (Windows 실행 파일명 포함)
         name_lower = name.lower()
         if name_lower in ['python', 'python.exe', 'python3', 'java', 'java.exe', 'node', 'node.exe']:
             libs = []
@@ -251,12 +288,16 @@ def get_process_info(pid: int) -> dict:
     except (psutil.NoSuchProcess, psutil.AccessDenied, FileNotFoundError):
         pass
     return None
-# --- [Script 2 기능 추가 완료] ---
+# --- [Script 2 기능 완료] ---
 
 
-# --- Script 1의 Syft 및 SBOM 헬퍼 (일부 수정) ---
+# --- Script 1의 Syft 및 SBOM 헬퍼 (Colab 연동을 위해 수정됨) ---
+
 def get_app_internal_libs(exe_name, pid, output_dir, proc_cmdline):
-    """(Script 1) 애플리케이션 내부 의존성 수집 (Syft 경로 스캔)"""
+    """
+    (Script 1) 애플리케이션 내부 의존성 수집 (Syft 경로 스캔)
+    [수정] Colab 분석을 위해 Syft JSON 출력 문자열도 반환합니다.
+    """
     script_path = None
     for arg in proc_cmdline:
         if arg.lower().endswith(('.py', '.js', '.jar', '.war')):
@@ -266,12 +307,11 @@ def get_app_internal_libs(exe_name, pid, output_dir, proc_cmdline):
     
     if not script_path:
         log("  > [S1] 내부 스캔: Syft 분석을 위한 스크립트/앱 경로를 명령줄에서 찾을 수 없습니다.")
-        return None
+        return None, None # out_file, json_content
 
-    # [수정] Windows 호환 (.exe)
     if not which("syft") and not which("syft.exe"):
         log("  > [S1] Syft 미설치. 내부 의존성 스캔 생략.")
-        return None
+        return None, None
         
     base_name = exe_name.split('.')[0]
     out_file_name = f"internal_sbom_app_libs_{base_name}_{pid}.json"
@@ -288,17 +328,20 @@ def get_app_internal_libs(exe_name, pid, output_dir, proc_cmdline):
         )
         
         if "No packages were found" in result.stderr or not result.stdout.strip():
-             log(f"  > [S1] Syft 내부 스캔: {exe_name}에서 애플리케이션 패키지 미발견."); return None
+             log(f"  > [S1] Syft 내부 스캔: {exe_name}에서 애플리케이션 패키지 미발견."); return None, None
              
+        # [S1] 원본 기능: 파일 저장
         with open(out_file, "w", encoding="utf-8") as fout: fout.write(result.stdout)
         log(f"  > [S1] Syft 내부 SBOM 생성됨 → {os.path.basename(out_file)}")
-        return out_file
+        
+        # [Colab] 추가 기능: JSON 문자열 반환
+        return out_file, result.stdout
         
     except subprocess.CalledProcessError as e:
         log(f"  > [S1] Syft 내부 스캔 실패: {e.stderr.strip()[:100]}...")
     except Exception as e:
         log(f"  > [S1] Syft 내부 스캔 실패: {e}")
-    return None
+    return None, None
 
 def get_process_context(proc):
     """(Script 1) 프로세스의 명령줄 인자와 환경 변수를 수집"""
@@ -307,7 +350,6 @@ def get_process_context(proc):
         context["command_line"] = " ".join(proc.cmdline())
     except (psutil.NoSuchProcess, psutil.AccessDenied): context["command_line"] = "N/A"
         
-    # [수정] Windows/Linux 공통 환경 변수
     env_vars_to_collect = ["PATH", "JAVA_HOME", "PYTHONPATH", "NODE_PATH", "CLASSPATH", "LD_LIBRARY_PATH", "USER", "HOME", "SystemRoot", "ProgramFiles"]
     env_data = {}
     try:
@@ -330,14 +372,17 @@ def save_context(context_data, output_dir, pid):
         log(f"  > [S1] 컨텍스트 저장 실패: {e}")
 
 def run_syft_v1_static(exe_file, pid, output_dir):
-    """(Script 1) Syft를 사용하여 정적 SBOM을 생성 (Script 2의 호환성 로직 추가)"""
+    """
+    (Script 1) Syft를 사용하여 정적 SBOM을 생성 (Script 2의 호환성 로직 추가)
+    [수정] Colab 분석을 위해 Syft JSON 출력 문자열도 반환합니다.
+    """
     if not which("syft") and not which("syft.exe"):
-        log(f"  > [S1] syft 미설치: {exe_file} static SBOM 생략"); return None
+        log(f"  > [S1] syft 미설치: {exe_file} static SBOM 생략"); return None, None
     
     out_file_name = f"static_sbom_{os.path.basename(exe_file)}_{pid}.json"
     out_file = os.path.join(output_dir, out_file_name)
     
-    # [수정] Script 2의 'scan'/'packages' 호환성 로직 적용
+    json_content = None
     try:
         # 1. 'scan' (신규) 시도
         command = ["syft", "scan", f"file:{exe_file}", "-o", "cyclonedx-json"]
@@ -345,6 +390,7 @@ def run_syft_v1_static(exe_file, pid, output_dir):
             command, capture_output=True, text=True, 
             encoding="utf-8", timeout=120, check=True, shell=(os.name == 'nt')
         )
+        json_content = result.stdout
     except subprocess.CalledProcessError as e:
         if "unknown command" in e.stderr:
             # 2. 'packages' (구) 시도
@@ -352,21 +398,24 @@ def run_syft_v1_static(exe_file, pid, output_dir):
             try:
                 command = ["syft", "packages", f"file:{exe_file}", "-o", "cyclonedx-json"]
                 result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=120, check=True, shell=(os.name == 'nt'))
+                json_content = result.stdout
             except Exception as e2:
-                log(f"  > [S1-Fix] syft (packages) 재시도 실패: {e2}"); return None
+                log(f"  > [S1-Fix] syft (packages) 재시도 실패: {e2}"); return None, None
         else:
-            log(f"  > [S1] syft (scan) 실행 실패: {e.stderr.strip()[:100]}..."); return None
+            log(f"  > [S1] syft (scan) 실행 실패: {e.stderr.strip()[:100]}..."); return None, None
     except Exception as e:
-         log(f"  > [S1] syft (scan) 실행 실패: {e}"); return None
+         log(f"  > [S1] syft (scan) 실행 실패: {e}"); return None, None
 
     # 성공 시 파일 저장
-    with open(out_file, "w", encoding="utf-8") as fout: fout.write(result.stdout)
+    with open(out_file, "w", encoding="utf-8") as fout: fout.write(json_content)
     log(f"  > [S1] Syft Static SBOM 생성됨 → {os.path.basename(out_file)}")
-    return out_file
+    
+    return out_file, json_content # [Colab] JSON 문자열 반환
 
 
 def create_cyclonedx_sbom_v1(exe_name, pid, libs_info, runtime=True):
     """(Script 1) CycloneDX 형식의 SBOM 딕셔너리 생성 (해시/버전 포함)"""
+    # ... (Script 1의 원본 함수, 수정 없음) ...
     sbom = {
         "bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
         "metadata": {
@@ -393,12 +442,13 @@ def create_cyclonedx_sbom_v1(exe_name, pid, libs_info, runtime=True):
     return sbom
 
 
-# --- [신규] 통합 프로세스 핸들러 ---
+# --- [통합] 프로세스 핸들러 (Colab 연동 기능 포함) ---
 def process_pid_unified(pid, exe_name_raw, exe_file, proc_cmdline_list):
     """
     Script 1의 'main' 루프가 호출할 통합 처리 함수.
-    Script 1의 기능과 Script 2의 상세 정보 수집 기능을 모두 수행합니다.
+    Script 1의 기능 + Script 2의 상세 정보 + Colab용 JSON 데이터 생성을 모두 수행합니다.
     """
+    global all_components_for_colab, seen_purls_for_colab, colab_data_lock
     
     # 1. 폴더 생성 (Script 1)
     current_time = datetime.now()
@@ -421,12 +471,24 @@ def process_pid_unified(pid, exe_name_raw, exe_file, proc_cmdline_list):
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         log(f"  > PID {pid}의 psutil 객체 생성 실패. 처리를 중단합니다."); return
     
+    # --- [Colab용] 핵심 동적 데이터 수집 ---
+    process_info = get_process_info(pid) # (Script 2)
+    colab_mem_percent = 0.0
+    colab_net_conns = 0
+    if process_info:
+        colab_mem_percent = process_info.get('MemoryPercent', 0.0)
+    try:
+        # [Colab용] NetConnections는 proc.connections()의 '개수'를 사용
+        colab_net_conns = len(proc.connections())
+    except Exception:
+        colab_net_conns = 0 # 권한 문제 등으로 실패 시 0
+    # --- [Colab용 수집 완료] ---
+
     # 2. 런타임 환경 컨텍스트 저장 (Script 1, 기능 #3)
     context_data = get_process_context(proc)
     save_context(context_data, output_dir, pid)
     
     # 3. 상세 프로세스 정보 저장 (Script 2, 기능 추가)
-    process_info = get_process_info(pid)
     if process_info:
         try:
             info_file = os.path.join(output_dir, f"process_info_ext_{pid}.json")
@@ -436,27 +498,97 @@ def process_pid_unified(pid, exe_name_raw, exe_file, proc_cmdline_list):
         except Exception as e:
             log(f"  > [S2] 상세 정보 저장 실패: {e}")
 
-    # 4. OS 수준 런타임 SBOM 생성 (Script 1, 기능 #4 - 해시/버전 포함)
+    # 4. OS 수준 런타임 SBOM 생성 (Script 1, 기능 #4)
     libs_info = get_loaded_libs_v1(pid)
     runtime_sbom_os = create_cyclonedx_sbom_v1(exe_name_raw, pid, libs_info, runtime=True)
     runtime_output_file = os.path.join(output_dir, f"runtime_sbom_os_libs_{pid}.json")
     save_sbom(runtime_sbom_os, runtime_output_file)
+    
+    # [Colab] 데이터 추가 (OS Libs)
+    for lib_path, info in libs_info.items():
+        name = os.path.basename(lib_path)
+        purl = f"pkg:generic/{name}?file_path={lib_path.replace(':', '').replace(os.sep, '/')}"
+        with colab_data_lock:
+            if purl not in seen_purls_for_colab:
+                seen_purls_for_colab.add(purl)
+                all_components_for_colab.append({
+                    "Name": name,
+                    "Version": info.get("version", "runtime"),
+                    "PURL": purl,
+                    "PID": pid,
+                    "Path": lib_path, # Colab이 'Path' -> 'description'으로 사용
+                    "MemoryPercent": colab_mem_percent,
+                    "NetConnections": colab_net_conns
+                })
 
     # 5. 애플리케이션 내부 의존성 SBOM 생성 (Script 1, 기능 #5)
-    get_app_internal_libs(exe_name_raw, pid, output_dir, proc_cmdline_list)
+    app_sbom_file, app_sbom_content = get_app_internal_libs(exe_name_raw, pid, output_dir, proc_cmdline_list)
     
-    # 6. Static SBOM 생성 (Script 1, 기능 #6 - Script 2 로직으로 개선됨)
+    # [Colab] 데이터 추가 (App Libs)
+    if app_sbom_content:
+        colab_app_libs = parse_syft_json_for_colab(app_sbom_content)
+        with colab_data_lock:
+            for lib in colab_app_libs:
+                if lib.get("PURL") and lib["PURL"] not in seen_purls_for_colab:
+                    seen_purls_for_colab.add(lib["PURL"])
+                    lib.update({
+                        "PID": pid,
+                        "MemoryPercent": colab_mem_percent,
+                        "NetConnections": colab_net_conns
+                    })
+                    all_components_for_colab.append(lib)
+
+    # 6. Static SBOM 생성 (Script 1, 기능 #6)
+    static_sbom_file, static_sbom_content = (None, None)
     if exe_file:
-        run_syft_v1_static(exe_file, pid, output_dir)
-    
-    log(f"  > PID {pid} ({exe_name_raw}) 처리 완료.")
+        static_sbom_file, static_sbom_content = run_syft_v1_static(exe_file, pid, output_dir)
+
+    # [Colab] 데이터 추가 (Static Libs)
+    if static_sbom_content:
+        colab_static_libs = parse_syft_json_for_colab(static_sbom_content)
+        with colab_data_lock:
+            for lib in colab_static_libs:
+                if lib.get("PURL") and lib["PURL"] not in seen_purls_for_colab:
+                    seen_purls_for_colab.add(lib["PURL"])
+                    lib.update({
+                        "PID": pid,
+                        "MemoryPercent": colab_mem_percent,
+                        "NetConnections": colab_net_conns
+                    })
+                    all_components_for_colab.append(lib)
+
+    # [Colab] 데이터 추가 (Script 2 - Python/Java Libs)
+    if process_info and process_info.get('Libraries'):
+        with colab_data_lock:
+            for lib in process_info['Libraries']:
+                name = lib.get('Name')
+                path = lib.get('Path')
+                purl = f"pkg:generic/{name}?path={path.replace(':', '').replace(os.sep, '/')}" # 단순 PURL 생성
+                if name.lower().startswith('python'):
+                    purl = f"pkg:pypi/{name}" # Pypi
+                elif name.lower().endswith('.jar'):
+                    purl = f"pkg:maven/unknown/{name.replace('.jar','')}" # Maven
+                
+                if purl not in seen_purls_for_colab:
+                    seen_purls_for_colab.add(purl)
+                    all_components_for_colab.append({
+                        "Name": name,
+                        "Version": "runtime",
+                        "PURL": purl,
+                        "PID": pid,
+                        "Path": path,
+                        "MemoryPercent": colab_mem_percent,
+                        "NetConnections": colab_net_conns
+                    })
+
+    log(f"  > PID {pid} ({exe_name_raw}) 처리 완료. [Colab] 총 {len(all_components_for_colab)}개 컴포넌트 누적.")
 
 
 # --- 메인 루프 (Script 1의 psutil 폴링 방식) ---
 def main():
     log(f"🏁 개별 프로세스 SBOM 감시 시작 (psutil 폴링, Windows 호환)")
+    log(f"   (종료 시 '{os.path.join(SBOM_DIR, 'sbom_output.json')}' 파일 생성)")
     
-    # 프로그램 시작 시 존재하는 모든 PID를 '이미 본 것'으로 처리
     log("... 현재 실행 중인 프로세스 목록을 스캔합니다 ...")
     try:
         for proc in psutil.process_iter(['pid']):
@@ -492,12 +624,19 @@ def main():
         time.sleep(1) # 1초 간격 폴링
 
 if __name__ == "__main__":
-    # [수정] eBPF/데몬화 로직을 모두 제거하고 Script 1의 'main'을 직접 실행
     try:
         main()
     except KeyboardInterrupt:
-        log("프로그램 종료 요청 (Ctrl+C).")
+        log("프로그램 종료 요청 (Ctrl+C). Colab용 최종 파일 저장을 시도합니다...")
+        # [Colab] 종료 시 최종 파일 저장
+        output_file = os.path.join(SBOM_DIR, "sbom_output.json")
+        save_colab_json(output_file)
         sys.exit(0)
     except Exception as e:
         log(f"치명적인 오류 발생: {e}")
+        # [Colab] 오류 발생 시에도 저장 시도
+        output_file = os.path.join(SBOM_DIR, "sbom_output.json")
+        if not os.path.exists(output_file) and all_components_for_colab:
+             log("오류 종료 전, Colab 파일 저장을 시도합니다...")
+             save_colab_json(output_file)
         sys.exit(1)
